@@ -8,6 +8,7 @@ from playwright.sync_api import Page, expect
 
 # 加载 Feature 文件
 scenarios('../features/login.feature')
+scenarios('../features/login2.feature')
 
 @given('I am on the login page')
 def open_login_page(page: Page):

@@ -1,14 +1,14 @@
 @p0 @smoke
-Feature: 1.1. Login Functionality
+Feature: 1.2.  Login Functionality 2
     As a user, I want to login to Swag Labs so that I can buy products.
 
-    Scenario: 1.1.1 Successful Login with standard user
+    Scenario: 1.2.1. Successful Login with standard user2
         Given I am on the login page
         When I login with user "standard_user" and password "secret_sauce"
         Then I should be redirected to inventory page
 
     @p1 @regression
-    Scenario Outline: 1.1.2 Failed Login attempts
+    Scenario Outline: 1.2.2. ailed Login attempts34
         Given I am on the login page
         When I login with user "<username>" and password "<password>"
         Then I should see error message "<error_msg>"

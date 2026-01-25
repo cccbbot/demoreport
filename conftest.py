@@ -5,6 +5,7 @@ import sys
 import platform
 import base64
 import logging
+import re
 from datetime import datetime
 from jinja2 import Environment
 
@@ -14,14 +15,9 @@ from jinja2 import Environment
 # ===========================
 
 class StepLogHandler(logging.Handler):
-    """
-    自定义日志处理器，用于临时存储单个 Step 执行期间产生的日志
-    """
-
     def __init__(self):
         super().__init__()
         self.records = []
-        # 设置默认格式
         self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
 
     def emit(self, record):
@@ -35,14 +31,71 @@ class StepLogHandler(logging.Handler):
         self.records = []
 
 
-# 初始化全局 Handler
 step_log_handler = StepLogHandler()
 logging.getLogger().addHandler(step_log_handler)
-# 确保捕获 INFO 及以上级别 (具体取决于用户 pytest.ini 配置，这里仅作为保底)
 logging.getLogger().setLevel(logging.INFO)
 
+
 # ===========================
-# 1. Step Execution Cache & Hooks
+# 1. Screenshot Helper
+# ===========================
+
+def _capture_screenshot_from_obj(obj):
+    if not obj:
+        return None
+    try:
+        # A. Playwright (return bytes)
+        if hasattr(obj, "screenshot"):
+            try:
+                img_bytes = obj.screenshot()
+                if img_bytes:
+                    return base64.b64encode(img_bytes).decode('utf-8')
+            except Exception:
+                pass
+        # B. Selenium (return base64 string)
+        elif hasattr(obj, "get_screenshot_as_base64"):
+            try:
+                return obj.get_screenshot_as_base64()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Warning: Failed to capture screenshot: {e}")
+    return None
+
+
+def _force_find_screenshot(request_or_item, func_args=None):
+    # 1. Try from func_args
+    if func_args:
+        for name in ["page", "driver", "browser", "context", "web_driver"]:
+            if name in func_args:
+                res = _capture_screenshot_from_obj(func_args[name])
+                if res: return res
+        for value in func_args.values():
+            res = _capture_screenshot_from_obj(value)
+            if res: return res
+
+    # 2. Try from global fixtures via request/item
+    fixture_names_to_try = ["page", "driver", "browser"]
+    if hasattr(request_or_item, "getfixturevalue"):
+        for name in fixture_names_to_try:
+            try:
+                obj = request_or_item.getfixturevalue(name)
+                res = _capture_screenshot_from_obj(obj)
+                if res: return res
+            except Exception:
+                continue
+
+    if hasattr(request_or_item, "funcargs"):
+        for name in fixture_names_to_try:
+            if name in request_or_item.funcargs:
+                res = _capture_screenshot_from_obj(request_or_item.funcargs[name])
+                if res: return res
+
+    return None
+
+
+# ===========================
+# 2. Hooks
 # ===========================
 step_execution_cache = {}
 
@@ -53,50 +106,47 @@ def get_step_cache(nodeid):
     return step_execution_cache[nodeid]
 
 
-# --- Pytest-BDD Hooks ---
-
 def pytest_bdd_before_scenario(request, feature, scenario):
     step_execution_cache[request.node.nodeid] = []
+    if hasattr(request.node, "b64_screenshot"):
+        del request.node.b64_screenshot
 
 
 def pytest_bdd_before_step(request, feature, scenario, step, step_func):
-    """Step 开始前清空日志缓冲区"""
     step_log_handler.reset()
 
 
 def pytest_bdd_after_step(request, feature, scenario, step, step_func, step_func_args):
-    """Step 结束后读取日志并保存"""
     cache = get_step_cache(request.node.nodeid)
-
-    # 获取本次 Step 执行期间捕获的日志
     captured_logs = list(step_log_handler.records)
-
     cache.append({
         "keyword": step.keyword,
         "name": step.name,
         "status": "passed",
         "duration": 0,
-        "logs": captured_logs  # <--- NEW: 保存日志列表
+        "logs": captured_logs
     })
 
 
 def pytest_bdd_step_error(request, feature, scenario, step, step_func, step_func_args, exception):
     cache = get_step_cache(request.node.nodeid)
-
-    # 即使报错，也保存已捕获的日志
     captured_logs = list(step_log_handler.records)
+
+    screenshot = _force_find_screenshot(request, func_args=step_func_args)
+    if screenshot:
+        request.node.b64_screenshot = screenshot
 
     cache.append({
         "keyword": step.keyword,
         "name": step.name,
         "status": "failed",
         "error": str(exception),
-        "logs": captured_logs  # <--- NEW
+        "logs": captured_logs
     })
 
 
 # ===========================
-# 2. Test Result Collection
+# 3. Report Data Collection
 # ===========================
 
 class TestSessionReport:
@@ -118,12 +168,15 @@ class TestSessionReport:
 
     def add_result(self, report, item):
         feature_name = "Unknown Feature"
+        scenario_name = item.name
+
         if hasattr(item, "_obj") and hasattr(item._obj, "__scenario__"):
             feature_name = item._obj.__scenario__.feature.name
+            scenario_name = item._obj.__scenario__.name
+            if hasattr(item, "callspec"):
+                scenario_name += f" ({item.callspec.id})"
         else:
             feature_name = item.nodeid.split("::")[0]
-
-        scenario_name = item.name
 
         if feature_name not in self.features:
             self.features[feature_name] = {
@@ -133,7 +186,6 @@ class TestSessionReport:
                 "status": "passed"
             }
 
-        # Global Log
         log_content = []
         if report.longrepr:
             log_content.append(f"=== Error Trace ===\n{report.longrepr}")
@@ -145,7 +197,11 @@ class TestSessionReport:
 
         for section_name, content in report.sections:
             log_content.append(f"\n=== {section_name} ===\n{content}")
+
+
         full_log = "\n".join(log_content)
+        full_log = full_log.replace('_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _','>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+
 
         status = report.outcome
         if status == "failed" and report.when != "call":
@@ -188,29 +244,6 @@ class TestSessionReport:
             self.skipped += 1
 
 
-def _capture_screenshot(item):
-    screenshot_base64 = None
-    driver = None
-    for name in ["driver", "browser", "page", "web_driver"]:
-        if name in item.funcargs:
-            driver = item.funcargs[name]
-            break
-    if not driver and item.instance:
-        if hasattr(item.instance, "driver"):
-            driver = item.instance.driver
-    if driver:
-        try:
-            if hasattr(driver, "get_screenshot_as_base64"):
-                screenshot_base64 = driver.get_screenshot_as_base64()
-            elif hasattr(driver, "screenshot"):
-                import base64
-                img_bytes = driver.screenshot()
-                screenshot_base64 = base64.b64encode(img_bytes).decode('utf-8')
-        except Exception:
-            pass
-    return screenshot_base64
-
-
 report_data = TestSessionReport()
 
 
@@ -218,11 +251,16 @@ report_data = TestSessionReport()
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    if report.when == "call" or (report.when in ["setup", "teardown"] and report.outcome != "passed"):
-        if report.outcome in ["failed", "skipped"] and report.when == "call":
-            report.screenshot = _capture_screenshot(item)
-        else:
-            report.screenshot = None
+
+    if report.when == "call" or (report.when in ["setup", "teardown"] and report.outcome == "failed"):
+        final_screenshot = None
+        if report.outcome == "failed":
+            if hasattr(item, "b64_screenshot") and item.b64_screenshot:
+                final_screenshot = item.b64_screenshot
+            if not final_screenshot:
+                final_screenshot = _force_find_screenshot(item, func_args=getattr(item, "funcargs", {}))
+
+        report.screenshot = final_screenshot
         report_data.add_result(report, item)
 
 
@@ -247,7 +285,7 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 # ===========================
-# 3. HTML Template
+# 4. HTML Template
 # ===========================
 
 HTML_TEMPLATE = """
@@ -265,7 +303,6 @@ HTML_TEMPLATE = """
         .card { border: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; border-radius: 6px; }
         .card-header { background-color: #fff; border-bottom: 1px solid #eee; font-weight: 600; padding: 12px 20px; }
 
-        /* Status Colors */
         .bg-pass { background-color: #28a745 !important; color: white; }
         .bg-fail { background-color: #dc3545 !important; color: white; }
         .bg-error { background-color: #fd7e14 !important; color: white; }
@@ -275,6 +312,9 @@ HTML_TEMPLATE = """
         .text-fail { color: #dc3545; }
         .text-error { color: #fd7e14; }
         .text-skip { color: #6c757d; }
+
+        .btn-purple { background-color: #6f42c1; border-color: #6f42c1; color: white; }
+        .btn-purple:hover { background-color: #59359a; border-color: #59359a; color: white; }
 
         .summary-box { padding: 15px; border-radius: 6px; color: white; text-align: center; }
         .summary-box h3 { margin: 0; font-weight: bold; font-size: 2em; }
@@ -292,8 +332,7 @@ HTML_TEMPLATE = """
         .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; min-width: 60px; display: inline-block; text-align: center; color: white;}
         .marker-badge { font-size: 0.7em; margin-left: 5px; opacity: 0.8; }
 
-        /* Log & Steps Styles */
-        .log-box { background: #2b2b2b; color: #f1f1f1; padding: 15px; border-radius: 4px; font-family: Consolas, monospace; white-space: pre-wrap; font-size: 0.9em; max-height: 500px; overflow-y: auto; display: none; margin: 10px 40px; border: 1px solid #444; }
+        .log-box { background: #2b2b2b; color: #f1f1f1; padding: 1px; border-radius: 1px; font-family: Consolas, monospace; white-space: pre-wrap; font-size: 0.9em; max-height: 500px; overflow-y: auto; display: none; margin: 10px 40px; border: 1px solid #444; }
 
         .step-container { margin: 10px 40px; background: #fff; padding: 15px; border-radius: 6px; border: 1px solid #eee; display: none; }
         .step-item { padding: 12px 0; border-bottom: 1px solid #f0f0f0; display: flex; align-items: start; }
@@ -304,7 +343,6 @@ HTML_TEMPLATE = """
         .step-name { color: #333; font-weight: 500; }
         .step-status { margin-left: 10px; font-size: 0.8em; padding-top: 0px; }
 
-        /* NEW: Step Logs Styles */
         .step-logs { 
             margin-top: 6px; 
             background-color: #f8f9fa; 
@@ -317,7 +355,67 @@ HTML_TEMPLATE = """
         }
         .log-line { display: block; white-space: pre-wrap; line-height: 1.4; }
 
-        .screenshot-box { margin-top: 15px; border-top: 1px dashed #555; padding-top: 10px; }
+        .screenshot-box { 
+            margin-top: 10px; 
+            padding-top: 5px; 
+            border-top: 1px solid #555; 
+        }
+        .screenshot-box h6 { 
+            color: #ccc; 
+            margin-bottom: 2px;
+            font-size: 0.85rem; 
+        }
+
+        .screenshot-img {
+            max-width: 100%;
+            height: auto;
+            border: 1px solid #555;
+            border-radius: 4px;
+            cursor: zoom-in;
+            transition: opacity 0.2s;
+            display: block;
+        }
+        .screenshot-img:hover { opacity: 0.9; }
+
+   
+        .modal {
+            display: none; 
+            position: fixed; 
+            z-index: 10000; 
+            padding-top: 50px; 
+            left: 0; top: 0; width: 100%; height: 100%; 
+            overflow: auto; 
+            background-color: rgba(0,0,0,0.9); 
+        }
+        .modal-content {
+            margin: auto;
+            display: block;
+            max-width: 90%;
+            max-height: 90vh;
+            border-radius: 5px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            animation-name: zoom;
+            animation-duration: 0.3s;
+        }
+        @keyframes zoom {
+            from {transform:scale(0)} to {transform:scale(1)}
+        }
+        .close {
+            position: absolute;
+            top: 20px;
+            right: 35px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
+            transition: 0.3s;
+            cursor: pointer;
+        }
+        .close:hover, .close:focus {
+            color: #bbb;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
         .chart-container { height: 350px; }
         .btn-filter.active { box-shadow: inset 0 3px 5px rgba(0,0,0,0.125); }
     </style>
@@ -325,7 +423,6 @@ HTML_TEMPLATE = """
 <body>
 
 <div class="container-fluid">
-    <!-- Environment Info -->
     <div class="card">
         <div class="card-body py-2">
             <div class="row align-items-center text-secondary small">
@@ -337,7 +434,6 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Dashboard Stats Area -->
     <div class="row">
         <div class="col-md-6">
             <div class="card h-100">
@@ -371,27 +467,20 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Detailed Report -->
     <div class="card">
         <div class="card-header d-flex flex-wrap justify-content-between align-items-center">
             <span class="mb-2 mb-md-0">Test Details</span>
-
             <div class="d-flex gap-2 align-items-center">
-                <!-- 1. Marker Filter -->
                 <select id="markerFilter" class="form-select form-select-sm" style="width: 150px;" onchange="applyFilter()">
                     <option value="all">All Markers</option>
                     {% for m in all_markers %}
                     <option value="{{ m }}">{{ m }}</option>
                     {% endfor %}
                 </select>
-
-                <!-- 2. Search Box -->
                 <div class="input-group input-group-sm" style="width: 250px;">
                     <span class="input-group-text bg-white fw-bold">Search</span>
                     <input type="text" id="searchInput" class="form-control" placeholder="Name..." onkeyup="applyFilter()">
                 </div>
-
-                <!-- 3. Status Buttons -->
                 <div class="btn-group btn-group-sm" role="group">
                     <button type="button" class="btn btn-outline-secondary btn-filter active" onclick="setFilterStatus('all')">TOTAL</button>
                     <button type="button" class="btn btn-outline-success btn-filter" onclick="setFilterStatus('passed')">PASSED</button>
@@ -413,8 +502,7 @@ HTML_TEMPLATE = """
                     </tr>
                 </thead>
                 <tbody>
-                    {% for feature_name, feature in features.items() %}
-                    <!-- Feature Row -->
+                    {% for feature_name, feature in features %}
                     <tr class="feature-row status-{{ feature.status }}" 
                         data-feature-name="{{ feature_name | lower }}"
                         data-bs-toggle="collapse" data-bs-target="#collapse-{{ loop.index }}">
@@ -432,12 +520,10 @@ HTML_TEMPLATE = """
                         <td><small class="text-muted">Expand/Collapse</small></td>
                     </tr>
 
-                    <!-- Scenarios Container -->
                     <tr class="collapse show" id="collapse-{{ loop.index }}">
                         <td colspan="4" class="p-0">
                             <table class="table mb-0 table-borderless bg-white">
                                 {% for scenario in feature.scenarios %}
-                                <!-- Scenario Row -->
                                 <tr class="scenario-row status-{{ scenario.status }}" 
                                     data-scenario-name="{{ scenario.name | lower }}"
                                     data-feature-parent="{{ feature_name | lower }}"
@@ -461,29 +547,24 @@ HTML_TEMPLATE = """
                                     </td>
                                     <td style="width: 15%">{{ scenario.duration }}s</td>
                                     <td style="width: 20%">
-                                        <button class="btn btn-sm btn-outline-secondary" style="font-size: 0.8em;" 
+                                        <button id="btn-details-{{ loop.index }}-{{ scenario.nodeid|hash }}"
+                                                class="btn btn-sm btn-outline-secondary" style="font-size: 0.8em;" 
                                                 onclick="toggleDetails('{{ loop.index }}-{{ scenario.nodeid|hash }}')">
-                                            Details
+                                            Details Expand
                                         </button>
                                     </td>
                                 </tr>
 
-                                <!-- Steps & Logs Row -->
                                 <tr class="details-row" id="details-row-{{ loop.index }}-{{ scenario.nodeid|hash }}" style="display:none; border-top: none;">
                                     <td colspan="4" class="p-0">
-
-                                        <!-- 1. BDD Steps Visualization -->
                                         {% if scenario.steps %}
                                         <div class="step-container" style="display: block;">
                                             <h6 class="border-bottom pb-2">Execution Steps</h6>
                                             {% for step in scenario.steps %}
                                             <div class="step-item">
                                                 <div class="step-keyword">{{ step.keyword }}</div>
-
                                                 <div class="step-content">
                                                     <div class="step-name">{{ step.name }}</div>
-
-                                                    <!-- NEW: Per-Step Logs -->
                                                     {% if step.logs %}
                                                     <div class="step-logs">
                                                         {% for log in step.logs %}
@@ -492,7 +573,6 @@ HTML_TEMPLATE = """
                                                     </div>
                                                     {% endif %}
                                                 </div>
-
                                                 <div class="step-status">
                                                     {% if step.status == 'passed' %}
                                                         <span class="badge bg-pass">PASS</span>
@@ -506,26 +586,16 @@ HTML_TEMPLATE = """
                                         </div>
                                         {% endif %}
 
-                                        <!-- 2. Logs & Screenshots -->
                                         <div class="log-box" style="display: block;">
                                             <div>{{ scenario.log | e }}</div>
-
                                             {% if scenario.status in ['failed', 'error'] %}
                                             <div class="screenshot-box">
-                                                <h6>Failure Screenshot</h6>
+                                                Failure Screenshot
                                                 {% if scenario.screenshot %}
-                                                    <div class="mt-2">
-                                                        <a href="data:image/png;base64,{{ scenario.screenshot }}" target="_blank">
-                                                            <img src="data:image/png;base64,{{ scenario.screenshot }}" 
-                                                                 class="img-fluid border rounded" 
-                                                                 style="max-width: 600px; max-height: 400px;" />
-                                                        </a>
-                                                        <div class="small text-muted mt-1">Click to enlarge</div>
-                                                    </div>
-                                                {% else %}
-                                                    <div class="alert alert-light border border-warning text-warning mt-2">
-                                                        <small>No screenshot captured (Check 'driver' fixture).</small>
-                                                    </div>
+                                                    <img src="data:image/png;base64,{{ scenario.screenshot }}" 
+                                                         class="screenshot-img" 
+                                                         onclick="showImage(this.src)" 
+                                                         alt="Failure Screenshot" />
                                                 {% endif %}
                                             </div>
                                             {% endif %}
@@ -543,9 +613,14 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Image Modal (Lightbox) -->
+<div id="imageModal" class="modal" onclick="closeImage()">
+    <span class="close" onclick="closeImage()">&times;</span>
+    <img class="modal-content" id="modalImg">
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // ECharts Initialization
     var chartFeatures = echarts.init(document.getElementById('chart-features'));
     var optionFeatures = {
         tooltip: { trigger: 'item' },
@@ -589,9 +664,7 @@ HTML_TEMPLATE = """
         chartCases.resize();
     });
 
-    // === COMBINED FILTER LOGIC ===
     var currentStatusFilter = 'all';
-
     function setFilterStatus(status) {
         currentStatusFilter = status;
         document.querySelectorAll('.btn-filter').forEach(b => b.classList.remove('active'));
@@ -654,12 +727,38 @@ HTML_TEMPLATE = """
 
     function toggleDetails(idSuffix) {
         var rowId = 'details-row-' + idSuffix;
+        var btnId = 'btn-details-' + idSuffix;
         var row = document.getElementById(rowId);
+        var btn = document.getElementById(btnId);
+
         if (row.style.display === "none" || row.style.display === "") {
             row.style.display = "table-row";
+            if (btn) {
+                btn.innerHTML = "Details Collapse";
+                btn.classList.remove('btn-outline-secondary');
+                btn.classList.add('btn-purple');
+            }
         } else {
             row.style.display = "none";
+            if (btn) {
+                btn.innerHTML = "Details Expand";
+                btn.classList.remove('btn-purple');
+                btn.classList.add('btn-outline-secondary');
+            }
         }
+    }
+
+    // Modal Image Functions
+    function showImage(src) {
+        var modal = document.getElementById("imageModal");
+        var modalImg = document.getElementById("modalImg");
+        modal.style.display = "block";
+        modalImg.src = src;
+    }
+
+    function closeImage() {
+        var modal = document.getElementById("imageModal");
+        modal.style.display = "none";
     }
 </script>
 </body>
@@ -678,12 +777,28 @@ def generate_html_report():
     def hash_filter(value):
         return abs(hash(value))
 
+    def get_sort_key(text):
+        match = re.match(r"(\d+(\.\d+)*)", text.strip())
+        if match:
+            return [int(x) for x in match.group(0).split('.') if x]
+        return [0]
+
+    features_list = sorted(
+        report_data.features.items(),
+        key=lambda item: get_sort_key(item[0])
+    )
+
+    for _, feature_data in features_list:
+        feature_data['scenarios'].sort(
+            key=lambda s: get_sort_key(s['name'])
+        )
+
     env = Environment()
     env.filters['hash'] = hash_filter
     template = env.from_string(HTML_TEMPLATE)
 
     html_content = template.render(
-        features=report_data.features,
+        features=features_list,
         all_markers=sorted(list(report_data.all_markers)),
         stats={
             "total": report_data.total,
