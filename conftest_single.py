@@ -41,15 +41,19 @@ logging.getLogger().setLevel(logging.INFO)
 # ===========================
 
 def _capture_screenshot_from_obj(obj):
-    if not obj: return None
+    if not obj:
+        return None
     try:
-        if hasattr(obj, "screenshot"):  # Playwright
+        # A. Playwright (return bytes)
+        if hasattr(obj, "screenshot"):
             try:
                 img_bytes = obj.screenshot()
-                if img_bytes: return base64.b64encode(img_bytes).decode('utf-8')
+                if img_bytes:
+                    return base64.b64encode(img_bytes).decode('utf-8')
             except Exception:
                 pass
-        elif hasattr(obj, "get_screenshot_as_base64"):  # Selenium
+        # B. Selenium (return base64 string)
+        elif hasattr(obj, "get_screenshot_as_base64"):
             try:
                 return obj.get_screenshot_as_base64()
             except Exception:
@@ -60,6 +64,7 @@ def _capture_screenshot_from_obj(obj):
 
 
 def _force_find_screenshot(request_or_item, func_args=None):
+    # 1. Try from func_args
     if func_args:
         for name in ["page", "driver", "browser", "context", "web_driver"]:
             if name in func_args:
@@ -69,6 +74,7 @@ def _force_find_screenshot(request_or_item, func_args=None):
             res = _capture_screenshot_from_obj(value)
             if res: return res
 
+    # 2. Try from global fixtures via request/item
     fixture_names_to_try = ["page", "driver", "browser"]
     if hasattr(request_or_item, "getfixturevalue"):
         for name in fixture_names_to_try:
@@ -84,11 +90,12 @@ def _force_find_screenshot(request_or_item, func_args=None):
             if name in request_or_item.funcargs:
                 res = _capture_screenshot_from_obj(request_or_item.funcargs[name])
                 if res: return res
+
     return None
 
 
 # ===========================
-# 2. Hooks (Worker Side)
+# 2. Hooks
 # ===========================
 step_execution_cache = {}
 
@@ -139,7 +146,7 @@ def pytest_bdd_step_error(request, feature, scenario, step, step_func, step_func
 
 
 # ===========================
-# 3. Report Data Collection (Master Side)
+# 3. Report Data Collection
 # ===========================
 
 class TestSessionReport:
@@ -159,12 +166,17 @@ class TestSessionReport:
         self.feature_error = 0
         self.feature_skipped = 0
 
-    def add_result(self, report):
-        # 注意：这里我们不再直接传递 item，而是传递处理后的 report 对象
-        # 所有必要的数据必须在 makereport 阶段挂载到 report 上
+    def add_result(self, report, item):
+        feature_name = "Unknown Feature"
+        scenario_name = item.name
 
-        feature_name = getattr(report, "feature_name", "Unknown Feature")
-        scenario_name = getattr(report, "scenario_name", report.nodeid)
+        if hasattr(item, "_obj") and hasattr(item._obj, "__scenario__"):
+            feature_name = item._obj.__scenario__.feature.name
+            scenario_name = item._obj.__scenario__.name
+            if hasattr(item, "callspec"):
+                scenario_name += f" ({item.callspec.id})"
+        else:
+            feature_name = item.nodeid.split("::")[0]
 
         if feature_name not in self.features:
             self.features[feature_name] = {
@@ -174,50 +186,47 @@ class TestSessionReport:
                 "status": "passed"
             }
 
-        # Clean Logs
-        def clean_traceback(text):
-            if not text: return ""
-            text = str(text)
-            return re.sub(r'(?m)^[-_ ]{4,}$.*\n?', '', text)
-
         log_content = []
         if report.longrepr:
-            cleaned_trace = clean_traceback(report.longrepr)
-            log_content.append(f"=== Error Trace ===\n{cleaned_trace}")
+            log_content.append(f"=== Error Trace ===\n{report.longrepr}")
         else:
             if report.outcome == 'passed':
                 log_content.append("=== Execution Result ===\nTest Passed successfully.")
             elif report.outcome == 'skipped':
-                skip_reason = str(report.longrepr[2]) if hasattr(report.longrepr, '__getitem__') else str(
-                    report.longrepr)
-                log_content.append(f"=== Skip Reason ===\n{skip_reason}")
+                log_content.append(f"=== Skip Reason ===\n{report.longrepr if report.longrepr else 'Skipped'}")
 
         for section_name, content in report.sections:
-            log_content.append(f"\n=== {section_name} ===\n{clean_traceback(content)}")
+            log_content.append(f"\n=== {section_name} ===\n{content}")
+
+
         full_log = "\n".join(log_content)
+        full_log = full_log.replace('_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _','>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+
 
         status = report.outcome
         if status == "failed" and report.when != "call":
             status = "error"
 
-        # 从 report 对象获取数据 (这些数据在 makereport 中被挂载)
-        screenshot = getattr(report, "extra_screenshot", None)
-        steps = getattr(report, "extra_steps", [])
-        markers = getattr(report, "extra_markers", [])
+        screenshot = getattr(report, "screenshot", None)
+        steps = step_execution_cache.get(item.nodeid, [])
 
-        # 收集 Markers 到全局集合
-        for m in markers:
-            self.all_markers.add(m)
+        ignored_markers = {'parametrize', 'usefixtures', 'filterwarnings', 'skip', 'skipif', 'xfail',
+                           'pytest_bdd_scenario'}
+        item_markers = []
+        for m in item.iter_markers():
+            if m.name not in ignored_markers:
+                item_markers.append(m.name)
+                self.all_markers.add(m.name)
 
         scenario_result = {
             "name": scenario_name,
             "status": status,
             "duration": round(report.duration, 4),
             "log": full_log,
-            "nodeid": report.nodeid,
+            "nodeid": item.nodeid,
             "screenshot": screenshot,
             "steps": steps,
-            "markers": markers
+            "markers": item_markers
         }
 
         self.features[feature_name]["scenarios"].append(scenario_result)
@@ -235,24 +244,15 @@ class TestSessionReport:
             self.skipped += 1
 
 
-# === Hook: Initialize Report Data on Master ===
-def pytest_configure(config):
-    # 如果是 Master 节点或者非分布式执行，初始化 ReportData
-    # workerinput 属性存在说明是 Worker 节点
-    if not hasattr(config, "workerinput"):
-        config.test_session_report = TestSessionReport()
+report_data = TestSessionReport()
 
 
-# === Hook: Worker Side - Collect Data & Attach to Report ===
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
 
-    # 逻辑：只处理 Call 阶段，或者 Setup/Teardown 失败的情况
     if report.when == "call" or (report.when in ["setup", "teardown"] and report.outcome == "failed"):
-
-        # 1. 收集截图
         final_screenshot = None
         if report.outcome == "failed":
             if hasattr(item, "b64_screenshot") and item.b64_screenshot:
@@ -260,97 +260,32 @@ def pytest_runtest_makereport(item, call):
             if not final_screenshot:
                 final_screenshot = _force_find_screenshot(item, func_args=getattr(item, "funcargs", {}))
 
-        # 2. 收集步骤信息
-        steps = step_execution_cache.get(item.nodeid, [])
-
-        # 3. 收集 Markers
-        ignored_markers = {'parametrize', 'usefixtures', 'filterwarnings', 'skip', 'skipif', 'xfail',
-                           'pytest_bdd_scenario'}
-        item_markers = []
-        for m in item.iter_markers():
-            if m.name not in ignored_markers:
-                item_markers.append(m.name)
-
-        # 4. 收集 Feature/Scenario 名称 (BDD)
-        feature_name = "Unknown Feature"
-        scenario_name = item.name
-        if hasattr(item, "_obj") and hasattr(item._obj, "__scenario__"):
-            feature_name = item._obj.__scenario__.feature.name
-            scenario_name = item._obj.__scenario__.name
-            if hasattr(item, "callspec"):
-                scenario_name += f" ({item.callspec.id})"
-        else:
-            feature_name = item.nodeid.split("::")[0]
-
-        # === 关键：将所有数据挂载到 report 对象上 ===
-        # xdist 会序列化这个 report 对象传给 Master
-        report.extra_screenshot = final_screenshot
-        report.extra_steps = steps
-        report.extra_markers = item_markers
-        report.feature_name = feature_name
-        report.scenario_name = scenario_name
-
-
-_master_report_data = None
-
-
-def pytest_sessionstart(session):
-    if not hasattr(session.config, "workerinput"):
-        global _master_report_data
-        _master_report_data = TestSessionReport()
-
-
-def pytest_runtest_logreport(report):
-
-    global _master_report_data
-
-    if _master_report_data is None:
-        return
-
-
-    if report.when == "call" or (report.when in ["setup", "teardown"] and report.outcome == "failed"):
-
-        if hasattr(report, "feature_name"):
-            _master_report_data.add_result(report)
+        report.screenshot = final_screenshot
+        report_data.add_result(report, item)
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """
-    会话结束时触发。
-    仅在 Master 节点生成最终的 HTML 报告。
-    """
-    if not hasattr(session.config, "workerinput"):
-        global _master_report_data
-        if _master_report_data:
-            # 计算总耗时
-            _master_report_data.duration = round(time.time() - _master_report_data.start_time, 2)
-
-            # 统计 Feature 维度的数据 (Pass/Fail/Error/Skip)
-            _master_report_data.feature_total = len(_master_report_data.features)
-            for f_name, f_data in _master_report_data.features.items():
-                stats = f_data["stats"]
-                if stats["failed"] > 0:
-                    f_data["status"] = "failed"
-                    _master_report_data.feature_failed += 1
-                elif stats["error"] > 0:
-                    f_data["status"] = "error"
-                    _master_report_data.feature_error += 1
-                elif stats["skipped"] == stats["total"] and stats["total"] > 0:
-                    f_data["status"] = "skipped"
-                    _master_report_data.feature_skipped += 1
-                else:
-                    f_data["status"] = "passed"
-                    _master_report_data.feature_passed += 1
-
-            # 调用生成函数
-            generate_html_report(_master_report_data)
-
-
-
+    report_data.duration = round(time.time() - report_data.start_time, 2)
+    report_data.feature_total = len(report_data.features)
+    for f_name, f_data in report_data.features.items():
+        stats = f_data["stats"]
+        if stats["failed"] > 0:
+            f_data["status"] = "failed"
+            report_data.feature_failed += 1
+        elif stats["error"] > 0:
+            f_data["status"] = "error"
+            report_data.feature_error += 1
+        elif stats["skipped"] == stats["total"] and stats["total"] > 0:
+            f_data["status"] = "skipped"
+            report_data.feature_skipped += 1
+        else:
+            f_data["status"] = "passed"
+            report_data.feature_passed += 1
+    generate_html_report()
 
 
 # ===========================
-# 4. HTML Template & Generation
+# 4. HTML Template
 # ===========================
 
 HTML_TEMPLATE = """
@@ -397,7 +332,7 @@ HTML_TEMPLATE = """
         .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; min-width: 60px; display: inline-block; text-align: center; color: white;}
         .marker-badge { font-size: 0.7em; margin-left: 5px; opacity: 0.8; }
 
-        .log-box { background: #2b2b2b; color: #f1f1f1; padding: 15px; border-radius: 4px; font-family: Consolas, monospace; white-space: pre-wrap; font-size: 0.9em; max-height: 500px; overflow-y: auto; display: none; margin: 10px 40px; border: 1px solid #444; }
+        .log-box { background: #2b2b2b; color: #f1f1f1; padding: 1px; border-radius: 1px; font-family: Consolas, monospace; white-space: pre-wrap; font-size: 0.9em; max-height: 500px; overflow-y: auto; display: none; margin: 10px 40px; border: 1px solid #444; }
 
         .step-container { margin: 10px 40px; background: #fff; padding: 15px; border-radius: 6px; border: 1px solid #eee; display: none; }
         .step-item { padding: 12px 0; border-bottom: 1px solid #f0f0f0; display: flex; align-items: start; }
@@ -420,7 +355,6 @@ HTML_TEMPLATE = """
         }
         .log-line { display: block; white-space: pre-wrap; line-height: 1.4; }
 
-        /* === SCREENSHOT & MODAL STYLES === */
         .screenshot-box { 
             margin-top: 10px; 
             padding-top: 5px; 
@@ -428,12 +362,12 @@ HTML_TEMPLATE = """
         }
         .screenshot-box h6 { 
             color: #ccc; 
-            margin-bottom: 2px; 
+            margin-bottom: 2px;
             font-size: 0.85rem; 
         }
 
         .screenshot-img {
-            max-width: 100%; 
+            max-width: 100%;
             height: auto;
             border: 1px solid #555;
             border-radius: 4px;
@@ -443,7 +377,7 @@ HTML_TEMPLATE = """
         }
         .screenshot-img:hover { opacity: 0.9; }
 
-        /* Modal (Lightbox) */
+   
         .modal {
             display: none; 
             position: fixed; 
@@ -463,13 +397,24 @@ HTML_TEMPLATE = """
             animation-name: zoom;
             animation-duration: 0.3s;
         }
-        @keyframes zoom { from {transform:scale(0)} to {transform:scale(1)} }
-        .close {
-            position: absolute; top: 20px; right: 35px;
-            color: #f1f1f1; font-size: 40px; font-weight: bold;
-            transition: 0.3s; cursor: pointer;
+        @keyframes zoom {
+            from {transform:scale(0)} to {transform:scale(1)}
         }
-        .close:hover, .close:focus { color: #bbb; text-decoration: none; cursor: pointer; }
+        .close {
+            position: absolute;
+            top: 20px;
+            right: 35px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
+            transition: 0.3s;
+            cursor: pointer;
+        }
+        .close:hover, .close:focus {
+            color: #bbb;
+            text-decoration: none;
+            cursor: pointer;
+        }
 
         .chart-container { height: 350px; }
         .btn-filter.active { box-shadow: inset 0 3px 5px rgba(0,0,0,0.125); }
@@ -645,19 +590,12 @@ HTML_TEMPLATE = """
                                             <div>{{ scenario.log | e }}</div>
                                             {% if scenario.status in ['failed', 'error'] %}
                                             <div class="screenshot-box">
-                                                <h6>Failure Screenshot</h6>
+                                                Failure Screenshot
                                                 {% if scenario.screenshot %}
-                                                    <div>
-                                                        <img src="data:image/png;base64,{{ scenario.screenshot }}" 
-                                                             class="screenshot-img" 
-                                                             onclick="showImage(this.src)" 
-                                                             alt="Failure Screenshot" />
-                                                        <div class="small text-muted mt-1">Click image to enlarge</div>
-                                                    </div>
-                                                {% else %}
-                                                    <div class="alert alert-light border border-warning text-warning mt-2">
-                                                        <small>No screenshot captured (Check 'driver' or 'page' fixture).</small>
-                                                    </div>
+                                                    <img src="data:image/png;base64,{{ scenario.screenshot }}" 
+                                                         class="screenshot-img" 
+                                                         onclick="showImage(this.src)" 
+                                                         alt="Failure Screenshot" />
                                                 {% endif %}
                                             </div>
                                             {% endif %}
@@ -675,7 +613,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Image Modal -->
+<!-- Image Modal (Lightbox) -->
 <div id="imageModal" class="modal" onclick="closeImage()">
     <span class="close" onclick="closeImage()">&times;</span>
     <img class="modal-content" id="modalImg">
@@ -810,6 +748,7 @@ HTML_TEMPLATE = """
         }
     }
 
+    // Modal Image Functions
     function showImage(src) {
         var modal = document.getElementById("imageModal");
         var modalImg = document.getElementById("modalImg");
@@ -827,12 +766,12 @@ HTML_TEMPLATE = """
 """
 
 
-def generate_html_report(report_data_obj):
+def generate_html_report():
     env_info = {
         "python_version": sys.version.split()[0],
         "platform": platform.platform(),
-        "start_time": datetime.fromtimestamp(report_data_obj.start_time).strftime('%Y-%m-%d %H:%M:%S'),
-        "duration": report_data_obj.duration
+        "start_time": datetime.fromtimestamp(report_data.start_time).strftime('%Y-%m-%d %H:%M:%S'),
+        "duration": report_data.duration
     }
 
     def hash_filter(value):
@@ -845,7 +784,7 @@ def generate_html_report(report_data_obj):
         return [0]
 
     features_list = sorted(
-        report_data_obj.features.items(),
+        report_data.features.items(),
         key=lambda item: get_sort_key(item[0])
     )
 
@@ -860,18 +799,18 @@ def generate_html_report(report_data_obj):
 
     html_content = template.render(
         features=features_list,
-        all_markers=sorted(list(report_data_obj.all_markers)),
+        all_markers=sorted(list(report_data.all_markers)),
         stats={
-            "total": report_data_obj.total,
-            "passed": report_data_obj.passed,
-            "failed": report_data_obj.failed,
-            "error": report_data_obj.error,
-            "skipped": report_data_obj.skipped,
-            "feature_total": report_data_obj.feature_total,
-            "feature_passed": report_data_obj.feature_passed,
-            "feature_failed": report_data_obj.feature_failed,
-            "feature_error": report_data_obj.feature_error,
-            "feature_skipped": report_data_obj.feature_skipped
+            "total": report_data.total,
+            "passed": report_data.passed,
+            "failed": report_data.failed,
+            "error": report_data.error,
+            "skipped": report_data.skipped,
+            "feature_total": report_data.feature_total,
+            "feature_passed": report_data.feature_passed,
+            "feature_failed": report_data.feature_failed,
+            "feature_error": report_data.feature_error,
+            "feature_skipped": report_data.feature_skipped
         },
         env=env_info
     )
